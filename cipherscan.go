@@ -8,12 +8,14 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 )
 
-func scanSite(host string, cipherID uint16) error {
+var scanCount int
+
+func scanSite(host string, ciphers []uint16) (uint16, error) {
+	scanCount++
 	config := &tls.Config{
-		CipherSuites:       []uint16{cipherID},
+		CipherSuites:       ciphers,
 		InsecureSkipVerify: skipVerify,
 	}
 	if serverName != "" {
@@ -21,21 +23,94 @@ func scanSite(host string, cipherID uint16) error {
 	}
 	conn, err := net.Dial("tcp", host)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer conn.Close()
 	serverCipher, err := tls.SayHello(conn, config)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if serverCipher != cipherID {
-		return errors.New("Server negotiated ciphersuite we didn't send.")
+	for _, cipherID := range ciphers {
+		if serverCipher == cipherID {
+			return serverCipher, nil
+		}
 	}
-	return nil
+	return 0, errors.New("Server negotiated ciphersuite we didn't send.")
+
+}
+func recursiveScanSite(host string, ciphers []uint16, sorted chan uint16) {
+	defer close(sorted)
+	if len(ciphers) == 0 {
+		return
+	}
+	cipherID, err := scanSite(host, ciphers)
+	if err == nil {
+		sorted <- cipherID
+		for i := 0; i < len(ciphers); i++ {
+			if ciphers[i] == cipherID {
+				ciphers[0], ciphers[i] = ciphers[i], ciphers[0]
+				ciphers = ciphers[1:]
+				break
+			}
+		}
+		left := make(chan uint16)
+		right := make(chan uint16)
+		go recursiveScanSite(host, ciphers[:len(ciphers)/2], left)
+		go recursiveScanSite(host, ciphers[len(ciphers)/2:], right)
+		var csLeft, csRight uint16
+		var haveLeft, haveRight bool
+		for {
+			if !haveLeft {
+				csLeft, haveLeft = <-left
+				if !haveLeft {
+					if haveRight {
+						sorted <- csRight
+					}
+					for csRight = range right {
+						sorted <- csRight
+					}
+					return
+				}
+			}
+			if !haveRight {
+				csRight, haveRight = <-right
+				if !haveRight {
+					if haveLeft {
+						sorted <- csLeft
+					}
+					for csLeft = range right {
+						sorted <- csLeft
+					}
+					return
+				}
+			}
+			cipherID, err := scanSite(host, []uint16{csLeft, csRight})
+			if err != nil {
+				fmt.Printf("Error with known-good ciphersuites (0x%x and 0x%x): %s\n", csLeft, csRight, err)
+			}
+			sorted <- cipherID
+			if cipherID == csLeft {
+				haveLeft = false
+			} else {
+				haveRight = false
+			}
+		}
+	}
+}
+func cipherIDsFromMap(cipherMap map[uint16]string) []uint16 {
+	ciphers := make([]uint16, len(cipherMap))
+	i := 0
+	for cipherID := range cipherMap {
+		ciphers[i] = cipherID
+		i++
+	}
+	return ciphers
 }
 
-var skipVerify bool
-var serverName string
+var (
+	skipVerify bool
+	serverName string
+)
 
 func main() {
 	var verbose bool
@@ -48,38 +123,24 @@ func main() {
 		os.Exit(1)
 	}
 	for _, host := range flag.Args() {
+		scanCount = 0
 		if !strings.ContainsRune(host, ':') {
 			host = host + ":443"
 		}
-		supported := make(chan uint16, len(cipherSuitesIANA))
-		var wg sync.WaitGroup
-		wg.Add(len(cipherSuitesIANA))
-		for cipherID, cipherName := range cipherSuitesIANA {
-			go func(cipherID uint16, cipherName string) {
-				err := scanSite(host, cipherID)
-				if err == nil {
-					if verbose {
-						fmt.Printf("%s (0x%04x): OK\n", cipherName, cipherID)
-					}
-					supported <- cipherID
-				} else if verbose {
-					fmt.Printf("%s (0x%04x): FAILED (%v)\n", cipherName, cipherID, err)
-				}
-				wg.Done()
-			}(cipherID, cipherName)
-		}
-		wg.Wait()
-		close(supported)
-		fmt.Printf("%s supports these %d ciphersuites:\n", host, len(supported))
+		supported := make(chan uint16, len(CipherSuites))
+		ciphers := cipherIDsFromMap(CipherSuites)
+		fmt.Printf("%s supports these ciphersuites for a TLS 1.2–SSL 3 compatable client:\n", host)
+		go recursiveScanSite(host, ciphers, supported)
 		for cipherID := range supported {
-			fmt.Printf("\t0x%04x: %s\n", cipherID, cipherSuitesIANA[cipherID])
+			fmt.Printf("\t0x%04x: %s\n", cipherID, CipherSuites[cipherID])
 		}
+		fmt.Printf("This scan required %d TLS dials\n", scanCount)
 	}
 }
 
-// cipherSuitesIANA contains all values in the TLS Cipher Suite Registry
+// CipherSuites contains all values in the TLS Cipher Suite Registry
 // https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml
-var cipherSuitesIANA = map[uint16]string{
+var CipherSuites = map[uint16]string{
 	0x0000: "TLS_NULL_WITH_NULL_NULL",
 	0x0001: "TLS_RSA_WITH_NULL_MD5",
 	0x0002: "TLS_RSA_WITH_NULL_SHA",
@@ -398,7 +459,6 @@ var cipherSuitesIANA = map[uint16]string{
 	0xC0AD: "TLS_ECDHE_ECDSA_WITH_AES_256_CCM",
 	0xC0AE: "TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8",
 	0xC0AF: "TLS_ECDHE_ECDSA_WITH_AES_256_CCM_8",
-
 	// Non-IANA standardized cipher suites:
 	// ChaCha20, Poly1305 cipher suites are defined in
 	// https://tools.ietf.org/html/draft-agl-tls-chacha20poly1305-04
