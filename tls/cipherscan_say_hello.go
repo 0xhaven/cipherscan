@@ -10,16 +10,14 @@ import (
 func SayHello(conn net.Conn, config *Config) (uint16, error) {
 	c := &Conn{conn: conn, config: config}
 	hello := &clientHelloMsg{
-		vers:                c.config.maxVersion(),
-		compressionMethods:  []uint8{compressionNone},
-		random:              make([]byte, 32),
-		ocspStapling:        true,
-		serverName:          c.config.ServerName,
-		supportedCurves:     c.config.curvePreferences(),
-		supportedPoints:     []uint8{pointFormatUncompressed},
-		nextProtoNeg:        len(c.config.NextProtos) > 0,
-		secureRenegotiation: true,
-		cipherSuites:        c.config.cipherSuites(),
+		vers:               c.config.maxVersion(),
+		compressionMethods: []uint8{compressionNone},
+		random:             make([]byte, 32),
+		ocspStapling:       true,
+		serverName:         c.config.ServerName,
+		supportedCurves:    c.config.curvePreferences(),
+		supportedPoints:    []uint8{pointFormatUncompressed},
+		cipherSuites:       c.config.cipherSuites(),
 	}
 
 	_, err := io.ReadFull(c.config.rand(), hello.random)
@@ -29,8 +27,7 @@ func SayHello(conn net.Conn, config *Config) (uint16, error) {
 	}
 
 	if hello.vers >= VersionTLS12 {
-		// TODO: enumerate all possible signatures and hashes
-		hello.signatureAndHashes = supportedSKXSignatureAlgorithms
+		hello.signatureAndHashes = allSignatureAndHashAlgorithms
 	}
 
 	c.writeRecord(recordTypeHandshake, hello.marshal())
